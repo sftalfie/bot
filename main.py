@@ -86,8 +86,8 @@ async def mirror_history(src, dst, sem):
                     wait=True
                 )
                 MESSAGE_MAP[m.id] = s.id
-            except:
-                pass
+            except Exception as e:
+                print(f"Cannot send message {m.id}: {e}")
 
 async def clone_channel(ch, dst, sem):
     overwrites = {}
@@ -166,50 +166,76 @@ async def clone_channel(ch, dst, sem):
 @bot.tree.command(name="backup")
 async def backup(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("no", ephemeral=True)
+        await interaction.response.send_message("Only admins can run this.", ephemeral=True)
         return
+
     src = bot.get_guild(ORIGINAL_GUILD_ID)
     dst = bot.get_guild(BACKUP_GUILD_ID)
     await interaction.response.defer(ephemeral=True)
+
     for c in dst.channels:
-        await c.delete()
+        try:
+            await c.delete()
+        except Exception as e:
+            print(f"Cannot delete channel {c.name}: {e}")
+
     for r in dst.roles:
         if r != dst.default_role:
-            await r.delete()
+            try:
+                await r.delete()
+            except discord.Forbidden:
+                print(f"Cannot delete role {r.name}, skipping")
+            except Exception as e:
+                print(f"Error deleting role {r.name}: {e}")
+
     CHANNEL_MAP.clear()
     CATEGORY_MAP.clear()
     THREAD_MAP.clear()
     MESSAGE_MAP.clear()
     ROLE_MAP.clear()
     save()
+
     for r in sorted(src.roles, key=lambda x: x.position):
         if r.is_default():
             ROLE_MAP[r.id] = dst.default_role.id
             continue
-        new_r = await dst.create_role(
-            name=r.name,
-            permissions=r.permissions,
-            colour=r.colour,
-            hoist=r.hoist,
-            mentionable=r.mentionable
-        )
-        ROLE_MAP[r.id] = new_r.id
+        try:
+            new_r = await dst.create_role(
+                name=r.name,
+                permissions=r.permissions,
+                colour=r.colour,
+                hoist=r.hoist,
+                mentionable=r.mentionable
+            )
+            ROLE_MAP[r.id] = new_r.id
+        except Exception as e:
+            print(f"Cannot create role {r.name}: {e}")
     save()
+
     for cat in sorted(src.categories, key=lambda c: c.position):
-        nc = await dst.create_category(name=cat.name, position=cat.position)
-        CATEGORY_MAP[cat.id] = nc.id
+        try:
+            nc = await dst.create_category(name=cat.name, position=cat.position)
+            CATEGORY_MAP[cat.id] = nc.id
+        except Exception as e:
+            print(f"Cannot create category {cat.name}: {e}")
     save()
+
     sem_c = asyncio.Semaphore(CHANNEL_CONCURRENCY)
     sem_m = asyncio.Semaphore(MESSAGE_CONCURRENCY)
+
     async def run(ch):
         async with sem_c:
-            await clone_channel(ch, dst, sem_m)
+            try:
+                await clone_channel(ch, dst, sem_m)
+            except Exception as e:
+                print(f"Cannot clone channel {ch.name}: {e}")
+
     ordered = sorted(
         [c for c in src.channels if not isinstance(c, discord.CategoryChannel)],
         key=lambda c: c.position
     )
     await asyncio.gather(*[run(c) for c in ordered])
-    await interaction.followup.send("done", ephemeral=True)
+    await interaction.followup.send("Backup completed successfully.", ephemeral=True)
 
 @bot.event
 async def on_message(m):
@@ -232,8 +258,8 @@ async def on_message(m):
         )
         MESSAGE_MAP[m.id] = s.id
         save()
-    except:
-        pass
+    except Exception as e:
+        print(f"Cannot mirror message {m.id}: {e}")
 
 @bot.event
 async def on_message_edit(b, a):
@@ -246,8 +272,8 @@ async def on_message_edit(b, a):
         ch = bot.get_channel(cid)
         m = await ch.fetch_message(MESSAGE_MAP[a.id])
         await m.edit(content=(a.content or "") + f"\n{a.jump_url}", embeds=a.embeds)
-    except:
-        pass
+    except Exception as e:
+        print(f"Cannot edit message {a.id}: {e}")
 
 @bot.event
 async def on_message_delete(m):
@@ -262,8 +288,8 @@ async def on_message_delete(m):
         await x.delete()
         MESSAGE_MAP.pop(m.id, None)
         save()
-    except:
-        pass
+    except Exception as e:
+        print(f"Cannot delete message {m.id}: {e}")
 
 @bot.event
 async def on_guild_channel_create(ch):
