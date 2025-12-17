@@ -1,113 +1,197 @@
 import discord
-from discord import app_commands, ui
-import os
+from discord import app_commands
+import os, asyncio, json
 from dotenv import load_dotenv
-import re
-import asyncio
 
 load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-BACKUP_GUILD_ID = 1450781750887448589
-ORIGINAL_GUILD_ID = 1369775313235480586
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-class MyBot(discord.Client):
+ORIGINAL_GUILD_ID = 1369775313235480586
+BACKUP_GUILD_ID = 1450781750887448589
+
+CHANNEL_CONCURRENCY = 5
+MESSAGE_CONCURRENCY = 30
+DATA_FILE = "sync_data.json"
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.messages = True
+intents.message_content = True
+
+CHANNEL_MAP = {}
+WEBHOOK_MAP = {}
+MESSAGE_MAP = {}
+
+def save_data():
+    with open(DATA_FILE, "w") as f:
+        json.dump({
+            "channels": CHANNEL_MAP,
+            "messages": MESSAGE_MAP
+        }, f)
+
+def load_data():
+    global CHANNEL_MAP, MESSAGE_MAP
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            data = json.load(f)
+            CHANNEL_MAP = {int(k): int(v) for k, v in data.get("channels", {}).items()}
+            MESSAGE_MAP = {int(k): int(v) for k, v in data.get("messages", {}).items()}
+
+class Bot(discord.Client):
     def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.messages = True
-        intents.guilds = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
-    async def on_message(self, message):
-        if message.author == self.user:
-            return
-        if message.guild.id == ORIGINAL_GUILD_ID:
-            backup_guild = self.get_guild(BACKUP_GUILD_ID)
-            if backup_guild:
-                backup_channel = discord.utils.get(backup_guild.channels, name=message.channel.name)
-                if backup_channel and isinstance(backup_channel, discord.TextChannel):
-                    files = [await att.to_file() for att in message.attachments]
-                    await backup_channel.send(content=f"**{message.author}**: {message.content}", files=files, embeds=message.embeds)
+    async def setup_hook(self):
+        await self.tree.sync()
+        load_data()
 
-    async def on_guild_channel_create(self, channel):
-        backup_guild = self.get_guild(BACKUP_GUILD_ID)
-        if backup_guild and channel.guild.id == ORIGINAL_GUILD_ID:
-            if isinstance(channel, discord.TextChannel):
-                await backup_guild.create_text_channel(name=channel.name, topic=channel.topic, position=channel.position)
-            elif isinstance(channel, discord.VoiceChannel):
-                await backup_guild.create_voice_channel(name=channel.name, position=channel.position)
+bot = Bot()
 
-    async def on_guild_channel_delete(self, channel):
-        backup_guild = self.get_guild(BACKUP_GUILD_ID)
-        if backup_guild and channel.guild.id == ORIGINAL_GUILD_ID:
-            backup_channel = discord.utils.get(backup_guild.channels, name=channel.name)
-            if backup_channel:
-                await backup_channel.delete()
+async def get_webhook(channel):
+    if channel.id in WEBHOOK_MAP:
+        return WEBHOOK_MAP[channel.id]
+    hook = await channel.create_webhook(name="Mirror")
+    WEBHOOK_MAP[channel.id] = hook
+    return hook
 
+async def copy_text_channel(src, backup_guild, msg_sem):
+    bc = await backup_guild.create_text_channel(
+        name=src.name,
+        topic=src.topic,
+        position=src.position
+    )
+    CHANNEL_MAP[src.id] = bc.id
+    save_data()
+    hook = await get_webhook(bc)
 
-bot = MyBot()
+    async for msg in src.history(limit=None, oldest_first=True):
+        async with msg_sem:
+            try:
+                files = [await a.to_file() for a in msg.attachments[:10]]
+                sent = await hook.send(
+                    content=(msg.content or "") + f"\n🔗 {msg.jump_url}",
+                    username=str(msg.author),
+                    avatar_url=msg.author.display_avatar.url,
+                    embeds=msg.embeds,
+                    files=files,
+                    wait=True
+                )
+                MESSAGE_MAP[msg.id] = sent.id
+            except:
+                pass
+    save_data()
 
-@bot.tree.command(name="backup", description="Copy all channels and messages from the original server to the backup server")
+@bot.tree.command(name="backup")
 async def backup(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message('Only admins can use this command.', ephemeral=True)
+        await interaction.response.send_message("no", ephemeral=True)
         return
-    original_guild = bot.get_guild(ORIGINAL_GUILD_ID)
-    backup_guild = bot.get_guild(BACKUP_GUILD_ID)
-    if not original_guild or not backup_guild:
-        await interaction.response.send_message('Original or backup server not found.', ephemeral=True)
+
+    src = bot.get_guild(ORIGINAL_GUILD_ID)
+    dst = bot.get_guild(BACKUP_GUILD_ID)
+
+    await interaction.response.defer(ephemeral=True)
+
+    for c in dst.channels:
+        await c.delete()
+
+    CHANNEL_MAP.clear()
+    MESSAGE_MAP.clear()
+    save_data()
+
+    sem_c = asyncio.Semaphore(CHANNEL_CONCURRENCY)
+    sem_m = asyncio.Semaphore(MESSAGE_CONCURRENCY)
+
+    async def proc(ch):
+        async with sem_c:
+            if isinstance(ch, discord.TextChannel):
+                await copy_text_channel(ch, dst, sem_m)
+            elif isinstance(ch, discord.VoiceChannel):
+                vc = await dst.create_voice_channel(name=ch.name, position=ch.position)
+                CHANNEL_MAP[ch.id] = vc.id
+                save_data()
+
+    await asyncio.gather(*[proc(c) for c in src.channels])
+
+    await interaction.followup.send("done", ephemeral=True)
+
+@bot.event
+async def on_message(msg):
+    if msg.author.bot or not msg.guild or msg.guild.id != ORIGINAL_GUILD_ID:
         return
-    await interaction.response.defer()
+    if msg.channel.id not in CHANNEL_MAP:
+        return
+
+    bc = bot.get_channel(CHANNEL_MAP[msg.channel.id])
+    hook = await get_webhook(bc)
+
     try:
-     
-        for channel in backup_guild.channels:
-            await channel.delete()
+        files = [await a.to_file() for a in msg.attachments[:10]]
+        sent = await hook.send(
+            content=(msg.content or "") + f"\n🔗 {msg.jump_url}",
+            username=str(msg.author),
+            avatar_url=msg.author.display_avatar.url,
+            embeds=msg.embeds,
+            files=files,
+            wait=True
+        )
+        MESSAGE_MAP[msg.id] = sent.id
+        save_data()
+    except:
+        pass
 
-        total_channels = len([c for c in original_guild.channels if isinstance(c, discord.TextChannel)])
-        processed_channels = 0
+@bot.event
+async def on_message_edit(before, after):
+    if after.id not in MESSAGE_MAP:
+        return
+    bc_id = CHANNEL_MAP.get(after.channel.id)
+    if not bc_id:
+        return
+    bc = bot.get_channel(bc_id)
+    try:
+        msg = await bc.fetch_message(MESSAGE_MAP[after.id])
+        await msg.edit(content=(after.content or "") + f"\n🔗 {after.jump_url}", embeds=after.embeds)
+    except:
+        pass
 
-    
-        for channel in original_guild.channels:
-            if isinstance(channel, discord.TextChannel):
-                backup_channel = await backup_guild.create_text_channel(name=channel.name, topic=channel.topic, position=channel.position)
-              
-                messages_to_copy = []
-                async for message in channel.history(limit=None, oldest_first=True):
-                    if message.author != bot.user: 
-                        messages_to_copy.append(message)
+@bot.event
+async def on_message_delete(msg):
+    if msg.id not in MESSAGE_MAP:
+        return
+    bc_id = CHANNEL_MAP.get(msg.channel.id)
+    if not bc_id:
+        return
+    bc = bot.get_channel(bc_id)
+    try:
+        m = await bc.fetch_message(MESSAGE_MAP[msg.id])
+        await m.delete()
+        MESSAGE_MAP.pop(msg.id, None)
+        save_data()
+    except:
+        pass
 
-               
-                batch_size = 5
-                for i in range(0, len(messages_to_copy), batch_size):
-                    batch = messages_to_copy[i:i + batch_size]
-                    tasks = []
-                    for message in batch:
-                        async def send_message(msg):
-                            try:
-                                files = []
-                                total_size = 0
-                                for att in msg.attachments:
-                                    if len(files) >= 10 or total_size + att.size > 8 * 1024 * 1024:
-                                        break
-                                    file = await att.to_file()
-                                    files.append(file)
-                                    total_size += att.size
-                                await backup_channel.send(content=f"**{msg.author}**: {msg.content}", files=files, embeds=msg.embeds)
-                            except discord.HTTPException as e:
-                                if e.code == 40005:
-                                    pass
-                                else:
-                                    raise
-                        tasks.append(send_message(message))
-                    await asyncio.gather(*tasks)
-                processed_channels += 1
-                if processed_channels % 5 == 0 or processed_channels == total_channels:
-                    await interaction.followup.send(f'Progress: {processed_channels}/{total_channels} channels copied.', ephemeral=True)
-            elif isinstance(channel, discord.VoiceChannel):
-                await backup_guild.create_voice_channel(name=channel.name, position=channel.position)
-        await interaction.followup.send('Backup completed: all channels and messages copied to backup server.')
-    except Exception as e:
-        await interaction.followup.send(f'Error during backup: {str(e)}')
+@bot.event
+async def on_guild_channel_create(ch):
+    if ch.guild.id != ORIGINAL_GUILD_ID:
+        return
+    dst = bot.get_guild(BACKUP_GUILD_ID)
+    if isinstance(ch, discord.TextChannel):
+        bc = await dst.create_text_channel(name=ch.name, topic=ch.topic, position=ch.position)
+        CHANNEL_MAP[ch.id] = bc.id
+    elif isinstance(ch, discord.VoiceChannel):
+        vc = await dst.create_voice_channel(name=ch.name, position=ch.position)
+        CHANNEL_MAP[ch.id] = vc.id
+    save_data()
+
+@bot.event
+async def on_guild_channel_delete(ch):
+    if ch.id not in CHANNEL_MAP:
+        return
+    bc = bot.get_channel(CHANNEL_MAP[ch.id])
+    if bc:
+        await bc.delete()
+    CHANNEL_MAP.pop(ch.id, None)
+    save_data()
 
 bot.run(TOKEN)
