@@ -13,16 +13,14 @@ CHANNEL_CONCURRENCY = 10
 MESSAGE_CONCURRENCY = 60
 DATA_FILE = "sync_data.json"
 
-intents = discord.Intents.default()
-intents.guilds = True
-intents.messages = True
-intents.message_content = True
+intents = discord.Intents.all()
 
 CHANNEL_MAP = {}
 CATEGORY_MAP = {}
 THREAD_MAP = {}
 WEBHOOK_MAP = {}
 MESSAGE_MAP = {}
+ROLE_MAP = {}
 
 def save():
     with open(DATA_FILE, "w") as f:
@@ -30,11 +28,12 @@ def save():
             "channels": CHANNEL_MAP,
             "categories": CATEGORY_MAP,
             "threads": THREAD_MAP,
-            "messages": MESSAGE_MAP
+            "messages": MESSAGE_MAP,
+            "roles": ROLE_MAP
         }, f)
 
 def load():
-    global CHANNEL_MAP, CATEGORY_MAP, THREAD_MAP, MESSAGE_MAP
+    global CHANNEL_MAP, CATEGORY_MAP, THREAD_MAP, MESSAGE_MAP, ROLE_MAP
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE) as f:
             d = json.load(f)
@@ -42,6 +41,7 @@ def load():
             CATEGORY_MAP = {int(k): int(v) for k, v in d.get("categories", {}).items()}
             THREAD_MAP = {int(k): int(v) for k, v in d.get("threads", {}).items()}
             MESSAGE_MAP = {int(k): int(v) for k, v in d.get("messages", {}).items()}
+            ROLE_MAP = {int(k): int(v) for k, v in d.get("roles", {}).items()}
 
 class Bot(discord.Client):
     def __init__(self):
@@ -86,83 +86,154 @@ async def mirror_history(src, dst, sem):
                     wait=True
                 )
                 MESSAGE_MAP[m.id] = s.id
-            except:
-                pass
+            except Exception as e:
+                print(f"Cannot send message {m.id}: {e}")
 
 async def clone_channel(ch, dst, sem):
-    if isinstance(ch, discord.TextChannel) or isinstance(ch, discord.NewsChannel):
-        bc = await dst.create_text_channel(
-            name=ch.name,
-            topic=ch.topic,
-            position=ch.position,
-            category=dst.get_channel(CATEGORY_MAP.get(ch.category_id))
-        )
-        CHANNEL_MAP[ch.id] = bc.id
-        save()
-        await mirror_history(ch, bc, sem)
+    overwrites = {}
+    for target, perms in ch.overwrites.items():
+        if isinstance(target, discord.Role):
+            role_id = ROLE_MAP.get(target.id)
+            if role_id:
+                overwrites[dst.get_role(role_id)] = perms
+        elif isinstance(target, discord.Member):
+            overwrites[dst.get_member(target.id)] = perms
 
-        for t in ch.threads:
-            nt = await bc.create_thread(name=t.name, type=t.type)
-            THREAD_MAP[t.id] = nt.id
+    if isinstance(ch, discord.TextChannel) or isinstance(ch, discord.NewsChannel):
+        bc = dst.get_channel(CHANNEL_MAP.get(ch.id))
+        if not bc:
+            bc = await dst.create_text_channel(
+                name=ch.name,
+                topic=ch.topic,
+                position=ch.position,
+                overwrites=overwrites,
+                category=dst.get_channel(CATEGORY_MAP.get(ch.category_id))
+            )
+            CHANNEL_MAP[ch.id] = bc.id
             save()
+        await mirror_history(ch, bc, sem)
+        async for t in ch.threads(limit=None):
+            nt = bc.get_thread(THREAD_MAP.get(t.id))
+            if not nt:
+                nt = await bc.create_thread(name=t.name, type=t.type)
+                THREAD_MAP[t.id] = nt.id
+                save()
+            await mirror_history(t, nt, sem)
+        archived = await ch.archived_threads().flatten()
+        for t in archived:
+            nt = bc.get_thread(THREAD_MAP.get(t.id))
+            if not nt:
+                nt = await bc.create_thread(name=t.name, type=t.type)
+                THREAD_MAP[t.id] = nt.id
+                save()
             await mirror_history(t, nt, sem)
 
     elif isinstance(ch, discord.VoiceChannel):
-        vc = await dst.create_voice_channel(
-            name=ch.name,
-            position=ch.position,
-            category=dst.get_channel(CATEGORY_MAP.get(ch.category_id))
-        )
-        CHANNEL_MAP[ch.id] = vc.id
-        save()
+        vc = dst.get_channel(CHANNEL_MAP.get(ch.id))
+        if not vc:
+            vc = await dst.create_voice_channel(
+                name=ch.name,
+                position=ch.position,
+                overwrites=overwrites,
+                category=dst.get_channel(CATEGORY_MAP.get(ch.category_id))
+            )
+            CHANNEL_MAP[ch.id] = vc.id
+            save()
 
     elif isinstance(ch, discord.StageChannel):
-        sc = await dst.create_stage_channel(
-            name=ch.name,
-            position=ch.position,
-            category=dst.get_channel(CATEGORY_MAP.get(ch.category_id))
-        )
-        CHANNEL_MAP[ch.id] = sc.id
-        save()
+        sc = dst.get_channel(CHANNEL_MAP.get(ch.id))
+        if not sc:
+            sc = await dst.create_stage_channel(
+                name=ch.name,
+                position=ch.position,
+                overwrites=overwrites,
+                category=dst.get_channel(CATEGORY_MAP.get(ch.category_id))
+            )
+            CHANNEL_MAP[ch.id] = sc.id
+            save()
 
     elif isinstance(ch, discord.ForumChannel):
-        fc = await dst.create_forum(
-            name=ch.name,
-            position=ch.position,
-            category=dst.get_channel(CATEGORY_MAP.get(ch.category_id))
-        )
-        CHANNEL_MAP[ch.id] = fc.id
-        save()
-        async for t in ch.threads:
-            nt = await fc.create_thread(name=t.name)
-            THREAD_MAP[t.id] = nt.id
+        fc = dst.get_channel(CHANNEL_MAP.get(ch.id))
+        if not fc:
+            fc = await dst.create_forum(
+                name=ch.name,
+                position=ch.position,
+                overwrites=overwrites,
+                category=dst.get_channel(CATEGORY_MAP.get(ch.category_id))
+            )
+            CHANNEL_MAP[ch.id] = fc.id
             save()
+        async for t in ch.threads(limit=None):
+            nt = fc.get_thread(THREAD_MAP.get(t.id))
+            if not nt:
+                nt = await fc.create_thread(name=t.name)
+                THREAD_MAP[t.id] = nt.id
+                save()
+            await mirror_history(t, nt, sem)
+        archived = await ch.archived_threads().flatten()
+        for t in archived:
+            nt = fc.get_thread(THREAD_MAP.get(t.id))
+            if not nt:
+                nt = await fc.create_thread(name=t.name)
+                THREAD_MAP[t.id] = nt.id
+                save()
             await mirror_history(t, nt, sem)
 
 @bot.tree.command(name="backup")
 async def backup(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("no", ephemeral=True)
+        await interaction.response.send_message("Only admins can run this.", ephemeral=True)
         return
 
     src = bot.get_guild(ORIGINAL_GUILD_ID)
     dst = bot.get_guild(BACKUP_GUILD_ID)
-
     await interaction.response.defer(ephemeral=True)
 
+    # Delete channels safely
     for c in dst.channels:
-        await c.delete()
+        if c.id not in CHANNEL_MAP.values() and not isinstance(c, discord.CategoryChannel):
+            try:
+                await c.delete()
+            except Exception as e:
+                print(f"Cannot delete channel {c.name}: {e}")
 
-    CHANNEL_MAP.clear()
-    CATEGORY_MAP.clear()
-    THREAD_MAP.clear()
-    MESSAGE_MAP.clear()
+    # Delete roles safely
+    for r in dst.roles:
+        if r != dst.default_role and r.id not in ROLE_MAP.values():
+            try:
+                await r.delete()
+            except discord.Forbidden:
+                print(f"Cannot delete role {r.name}, skipping")
+            except Exception as e:
+                print(f"Error deleting role {r.name}: {e}")
+
+    # Clone roles
+    for r in sorted(src.roles, key=lambda x: x.position):
+        if r.is_default():
+            ROLE_MAP[r.id] = dst.default_role.id
+            continue
+        if r.id not in ROLE_MAP:
+            try:
+                new_r = await dst.create_role(
+                    name=r.name,
+                    permissions=r.permissions,
+                    colour=r.colour,
+                    hoist=r.hoist,
+                    mentionable=r.mentionable
+                )
+                ROLE_MAP[r.id] = new_r.id
+            except Exception as e:
+                print(f"Cannot create role {r.name}: {e}")
     save()
 
+    # Clone categories
     for cat in sorted(src.categories, key=lambda c: c.position):
-        nc = await dst.create_category(name=cat.name, position=cat.position)
-        CATEGORY_MAP[cat.id] = nc.id
-
+        if cat.id not in CATEGORY_MAP:
+            try:
+                nc = await dst.create_category(name=cat.name, position=cat.position)
+                CATEGORY_MAP[cat.id] = nc.id
+            except Exception as e:
+                print(f"Cannot create category {cat.name}: {e}")
     save()
 
     sem_c = asyncio.Semaphore(CHANNEL_CONCURRENCY)
@@ -170,16 +241,17 @@ async def backup(interaction: discord.Interaction):
 
     async def run(ch):
         async with sem_c:
-            await clone_channel(ch, dst, sem_m)
+            try:
+                await clone_channel(ch, dst, sem_m)
+            except Exception as e:
+                print(f"Cannot clone channel {ch.name}: {e}")
 
     ordered = sorted(
         [c for c in src.channels if not isinstance(c, discord.CategoryChannel)],
         key=lambda c: c.position
     )
-
     await asyncio.gather(*[run(c) for c in ordered])
-
-    await interaction.followup.send("done", ephemeral=True)
+    await interaction.followup.send("Backup completed successfully.", ephemeral=True)
 
 @bot.event
 async def on_message(m):
@@ -202,8 +274,8 @@ async def on_message(m):
         )
         MESSAGE_MAP[m.id] = s.id
         save()
-    except:
-        pass
+    except Exception as e:
+        print(f"Cannot mirror message {m.id}: {e}")
 
 @bot.event
 async def on_message_edit(b, a):
@@ -216,8 +288,8 @@ async def on_message_edit(b, a):
         ch = bot.get_channel(cid)
         m = await ch.fetch_message(MESSAGE_MAP[a.id])
         await m.edit(content=(a.content or "") + f"\n{a.jump_url}", embeds=a.embeds)
-    except:
-        pass
+    except Exception as e:
+        print(f"Cannot edit message {a.id}: {e}")
 
 @bot.event
 async def on_message_delete(m):
@@ -232,8 +304,8 @@ async def on_message_delete(m):
         await x.delete()
         MESSAGE_MAP.pop(m.id, None)
         save()
-    except:
-        pass
+    except Exception as e:
+        print(f"Cannot delete message {m.id}: {e}")
 
 @bot.event
 async def on_guild_channel_create(ch):
@@ -242,8 +314,9 @@ async def on_guild_channel_create(ch):
     dst = bot.get_guild(BACKUP_GUILD_ID)
     sem = asyncio.Semaphore(5)
     if isinstance(ch, discord.CategoryChannel):
-        nc = await dst.create_category(name=ch.name, position=ch.position)
-        CATEGORY_MAP[ch.id] = nc.id
+        if ch.id not in CATEGORY_MAP:
+            nc = await dst.create_category(name=ch.name, position=ch.position)
+            CATEGORY_MAP[ch.id] = nc.id
     else:
         await clone_channel(ch, dst, sem)
     save()
