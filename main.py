@@ -96,8 +96,8 @@ async def clone_channel(ch, dst, sem):
             role_id = ROLE_MAP.get(target.id)
             if role_id:
                 overwrites[dst.get_role(role_id)] = perms
-        else:
-            overwrites[target] = perms
+        elif isinstance(target, discord.Member):
+            overwrites[dst.get_member(target.id)] = perms
 
     if isinstance(ch, discord.TextChannel) or isinstance(ch, discord.NewsChannel):
         bc = await dst.create_text_channel(
@@ -110,7 +110,13 @@ async def clone_channel(ch, dst, sem):
         CHANNEL_MAP[ch.id] = bc.id
         save()
         await mirror_history(ch, bc, sem)
-        for t in ch.threads:
+        async for t in ch.threads(limit=None):
+            nt = await bc.create_thread(name=t.name, type=t.type)
+            THREAD_MAP[t.id] = nt.id
+            save()
+            await mirror_history(t, nt, sem)
+        archived = await ch.archived_threads().flatten()
+        for t in archived:
             nt = await bc.create_thread(name=t.name, type=t.type)
             THREAD_MAP[t.id] = nt.id
             save()
@@ -145,7 +151,13 @@ async def clone_channel(ch, dst, sem):
         )
         CHANNEL_MAP[ch.id] = fc.id
         save()
-        async for t in ch.threads:
+        async for t in ch.threads(limit=None):
+            nt = await fc.create_thread(name=t.name)
+            THREAD_MAP[t.id] = nt.id
+            save()
+            await mirror_history(t, nt, sem)
+        archived = await ch.archived_threads().flatten()
+        for t in archived:
             nt = await fc.create_thread(name=t.name)
             THREAD_MAP[t.id] = nt.id
             save()
